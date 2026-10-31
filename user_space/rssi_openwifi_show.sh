@@ -1,6 +1,11 @@
 #!/bin/bash
 
-rssi_raw=$(./sdrctl dev sdr0 get reg xpu 57)
+if [ -x ./sdrctl ]; then
+  SDRCTL=./sdrctl
+else
+  SDRCTL=sdrctl
+fi
+rssi_raw=$($SDRCTL dev sdr0 get reg xpu 57)
 echo $rssi_raw
 
 rssi_raw=${rssi_raw: -8}

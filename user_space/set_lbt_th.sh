@@ -6,13 +6,19 @@ else
   lbt_th=987654321 # no input
 fi
 
+if [ -x ./sdrctl ]; then
+  SDRCTL=./sdrctl
+else
+  SDRCTL=sdrctl
+fi
+
 set -x
 #set
 if [ $lbt_th -ne 987654321 ]; then
-  ./sdrctl dev sdr0 set reg drv_xpu 0 $lbt_th
+  $SDRCTL dev sdr0 set reg drv_xpu 0 $lbt_th
 fi
 
 # show
-# ./sdrctl dev sdr0 get reg xpu 8 
-./sdrctl dev sdr0 get reg drv_xpu 0
+# ./sdrctl dev sdr0 get reg xpu 8
+$SDRCTL dev sdr0 get reg drv_xpu 0
 set +x

@@ -5,7 +5,7 @@ home_dir=$(pwd)
 if test -d "/sys/devices/platform/fpga-axi@0/fpga-axi@0:sdr"; then
   cd /sys/devices/platform/fpga-axi@0/fpga-axi@0:sdr
 else 
-  cd /sys/devices/soc0/fpga-axi\@0/fpga-axi\@0\:sdr
+  cd /sys/devices/soc0/axi/axi:sdr
 fi
 
 # set

@@ -674,7 +674,12 @@ xilinx_dma_alloc_tx_descriptor(struct xilinx_dma_chan *chan)
 {
 	struct xilinx_dma_tx_descriptor *desc;
 
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	/*
+	 * openwifi_tx calls device_prep_slave_sg while holding priv->lock
+	 * (spin_lock_irqsave). GFP_KERNEL can sleep in reclaim and leave
+	 * that ticket owned by a task that is not running.
+	 */
+	desc = kzalloc(sizeof(*desc), GFP_ATOMIC);
 	if (!desc)
 		return NULL;
 

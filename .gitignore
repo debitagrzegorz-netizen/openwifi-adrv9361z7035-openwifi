@@ -1,0 +1,14 @@
+# Module build products. pre_def.h and git_rev.h are generated per board.
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+driver/pre_def.h
+driver/git_rev.h
+driver/test/

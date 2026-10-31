@@ -15,6 +15,7 @@
 
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/workqueue.h>
 
 #include <linux/dmaengine.h>
 #include <linux/slab.h>
@@ -23,6 +24,7 @@
 
 #include <linux/init.h>
 #include <linux/kthread.h>
+#include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
@@ -123,6 +125,25 @@ MODULE_PARM_DESC(myint, "test_mode. bit0: aggregation enable(1)/disable(0)");
 
 module_param(init_tx_att, int, 0);
 MODULE_PARM_DESC(myint, "init_tx_att. TX attenuation in dB*1000  example: set to 3000 for 3dB attenuation");
+
+/*
+ * irq_mode — SoftMAC IRQ registration strategy (boot-critical).
+ *
+ *  0 = skip request_irq; openwifi_start returns -EOPNOTSUPP (SSH-safe).
+ *  1 = exclusive threaded IRQF_ONESHOT|IRQF_NO_AUTOEN (DEFAULT).
+ *      Process-context handlers; deferred enable after start returns.
+ *  2 = legacy hardirq IRQF_SHARED (unsafe; lab only).
+ */
+static int irq_mode = 1;
+module_param(irq_mode, int, 0644);
+MODULE_PARM_DESC(irq_mode,
+	"0=skip IRQs; 1=threaded ONESHOT+NO_AUTOEN (default); 2=SHARED hardirq unsafe");
+
+/* Delay before FPGA unmask + enable_irq so openwifi_start/udev can finish */
+static int irq_arm_delay_ms = 100;
+module_param(irq_arm_delay_ms, int, 0644);
+MODULE_PARM_DESC(irq_arm_delay_ms,
+	"ms after openwifi_start before enable_irq+FPGA unmask (default 100)");
 
 // ---------------rfkill---------------------------------------
 static bool openwifi_is_radio_enabled(struct openwifi_priv *priv)
@@ -478,10 +499,15 @@ static irqreturn_t openwifi_rx_interrupt(int irq, void *dev_id)
   s8 signal, phase_offset;
   u16 agc_status_and_pkt_exist_flag, rssi_half_db, addr1_high16, addr2_high16=0, addr3_high16=0, seq_no=0;
   bool content_ok, len_overflow, is_unicast;
+  unsigned long flags;
+
+  /* Not fully armed yet (deferred enable) — ignore spurious edges */
+  if (!READ_ONCE(priv->irq_armed) || !priv->rx_cyclic_buf)
+    return IRQ_HANDLED;
 
 #ifdef USE_NEW_RX_INTERRUPT
   int i;
-  spin_lock(&priv->lock);
+  spin_lock_irqsave(&priv->lock, flags);
   for (i=0; i<NUM_RX_BD; i++) {
     pdata_tmp = priv->rx_cyclic_buf + i*RX_BD_BUF_SIZE;
     agc_status_and_pkt_exist_flag = (*((u16*)(pdata_tmp+10))); //check rx_intf_pl_to_m_axis.v. FPGA TODO: add pkt exist 1bit flag next to gpio_status_lock_by_sig_valid
@@ -489,8 +515,16 @@ static irqreturn_t openwifi_rx_interrupt(int irq, void *dev_id)
       continue;
 #else
   static u8 target_buf_idx_old = 0;
-  spin_lock(&priv->lock);
+  spin_lock_irqsave(&priv->lock, flags);
   while(1) { // loop all rx buffers that have new rx packets
+    /* Bound legacy path: garbage flags must not spin forever under lock */
+    if (loop_count > NUM_RX_BD) {
+      printk_ratelimited(KERN_ERR "%s openwifi_rx_interrupt: abort after %u iters\n",
+                         sdr_compatible_str, loop_count);
+      /* Temporarily remask FPGA RX source if we are thrashing empty BDs */
+      rx_intf_api->RX_INTF_REG_INTERRUPT_TEST_write(0x100);
+      break;
+    }
     pdata_tmp = priv->rx_cyclic_buf + target_buf_idx_old*RX_BD_BUF_SIZE; // our header insertion is at the beginning
     agc_status_and_pkt_exist_flag = (*((u16*)(pdata_tmp+10)));
     if ( agc_status_and_pkt_exist_flag==0 ) // no packet in the buffer
@@ -525,8 +559,9 @@ static irqreturn_t openwifi_rx_interrupt(int irq, void *dev_id)
       // }
       content_ok = true;
     } else {
-      printk("%s openwifi_rx: WARNING content! len%d overflow%d rate_idx%d\n", sdr_compatible_str,
-      len, len_overflow, rate_idx);
+      printk_ratelimited(KERN_WARNING
+        "%s openwifi_rx: WARNING content! len%d overflow%d rate_idx%d\n",
+        sdr_compatible_str, len, len_overflow, rate_idx);
       content_ok = false;
     }
 
@@ -566,6 +601,15 @@ static irqreturn_t openwifi_rx_interrupt(int irq, void *dev_id)
 
     // priv->phy_rx_sn_hw_old = phy_rx_sn_hw;
     if (content_ok) {
+      /* Channel may not be set yet during early IRQ arm — skip inject */
+      if (!dev->conf.chandef.chan) {
+        (*((u16*)(pdata_tmp+10))) = 0;
+        loop_count++;
+#ifndef USE_NEW_RX_INTERRUPT
+        target_buf_idx_old=((target_buf_idx_old+1)&(NUM_RX_BD-1));
+#endif
+        continue;
+      }
       skb = dev_alloc_skb(len);
       if (skb) {
         skb_put_data(skb,pdata_tmp+16,len);
@@ -655,8 +699,21 @@ static irqreturn_t openwifi_rx_interrupt(int irq, void *dev_id)
   if ( loop_count!=1 && (priv->drv_rx_reg_val[DRV_RX_REG_IDX_PRINT_CFG]&DMESG_LOG_ERROR) )
     printk("%s openwifi_rx: WARNING loop_count %d\n", sdr_compatible_str,loop_count);
 
+  /*
+   * Empty ring wake-ups: with EDGE_RISING DT this is rare. With LEVEL_HIGH
+   * (old DT) the sticky FPGA line re-enters forever — count empty IRQs.
+   */
+  if (loop_count == 0) {
+    static unsigned long empty_rx_irqs;
+    empty_rx_irqs++;
+    if ((empty_rx_irqs & 0x3fff) == 0)
+      printk_ratelimited(KERN_WARNING
+        "%s openwifi_rx: empty-ring IRQ storm count~%lu (check DT EDGE vs LEVEL)\n",
+        sdr_compatible_str, empty_rx_irqs);
+  }
+
 // openwifi_rx_out:
-  spin_unlock(&priv->lock);
+  spin_unlock_irqrestore(&priv->lock, flags);
   return IRQ_HANDLED;
 }
 
@@ -675,28 +732,46 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
   // u16 prio_rd_idx_store[64]={0};
   bool tx_fail=false, fpga_queue_has_room=false;
   bool use_ht_aggr, pkt_need_ack, use_ht_rate, prio_wake_up_flag = false;
+  unsigned long flags;
 
-  spin_lock(&priv->lock);
+  if (!READ_ONCE(priv->irq_armed))
+    return IRQ_HANDLED;
+
+  spin_lock_irqsave(&priv->lock, flags);
 
   while(1) { // loop all packets that have been sent by FPGA
+    /* Bound IRQ work so a stuck PKT_INFO cannot spin forever under the lock.
+     * Do not remask the FPGA TX IRQ: that permanently stops BD reap and
+     * fills the software ring (the P12 hang). */
+    if (loop_count > (NUM_TX_BD * 2)) {
+      printk_ratelimited(KERN_ERR "%s openwifi_tx_interrupt: abort after %u iters (PKT_INFO stuck?)\n",
+                         sdr_compatible_str, loop_count);
+      break;
+    }
+
     reg_val1 = tx_intf_api->TX_INTF_REG_PKT_INFO1_read();
         reg_val2 = tx_intf_api->TX_INTF_REG_PKT_INFO2_read();
     blk_ack_bitmap = (tx_intf_api->TX_INTF_REG_PKT_INFO3_read() | ((u64)tx_intf_api->TX_INTF_REG_PKT_INFO4_read())<<32);
 
-    if (reg_val1!=0xFFFFFFFF) {
-      nof_retx = (reg_val1&0xF);
-      last_bd_rd_idx = ((reg_val1>>5)&(NUM_TX_BD-1));
-      prio = ((reg_val1>>17)&0x3);
-      num_slot_random = ((reg_val1>>19)&0x1FF);
-      //num_slot_random = ((0xFF80000 &reg_val1)>>(2+5+NUM_BIT_MAX_PHY_TX_SN+NUM_BIT_MAX_NUM_HW_QUEUE));
-      cw = ((reg_val1>>28)&0xF);
-      //cw = ((0xF0000000 & reg_val1) >> 28);
-      if(cw > 10) {
-        cw = 10 ;
-        num_slot_random += 512 ;
-      }
-      pkt_cnt = (reg_val2&0x3F);
-      blk_ack_ssn = ((reg_val2>>6)&0xFFF);
+    /* Empty FIFO: FPGA returns all-ones. A zero word can be a real completion. */
+    if (reg_val1 == 0xFFFFFFFF)
+      break;
+
+    nof_retx = (reg_val1&0xF);
+    last_bd_rd_idx = ((reg_val1>>5)&(NUM_TX_BD-1));
+    prio = ((reg_val1>>17)&0x3);
+    num_slot_random = ((reg_val1>>19)&0x1FF);
+    //num_slot_random = ((0xFF80000 &reg_val1)>>(2+5+NUM_BIT_MAX_PHY_TX_SN+NUM_BIT_MAX_NUM_HW_QUEUE));
+    cw = ((reg_val1>>28)&0xF);
+    //cw = ((0xF0000000 & reg_val1) >> 28);
+    if(cw > 10) {
+      cw = 10 ;
+      num_slot_random += 512 ;
+    }
+    pkt_cnt = (reg_val2&0x3F);
+    if (pkt_cnt == 0)
+      break;
+    blk_ack_ssn = ((reg_val2>>6)&0xFFF);
 
       queue_idx = ((reg_val1>>15)&(MAX_NUM_HW_QUEUE-1));
       dma_fifo_no_room_flag = tx_intf_api->TX_INTF_REG_S_AXIS_FIFO_NO_ROOM_read();
@@ -745,7 +820,7 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
         seq_no = ring->bds[ring->bd_rd_idx].seq_no;
 
         if (seq_no == 0xffff) {// it has been forced cleared by the openwifi_tx (due to out-of-order Tx of different queues to the air?)
-          printk("%s openwifi_tx_interrupt: WARNING wr%d rd%d last_bd_rd_idx%d i%d pkt_cnt%d prio%d fpga q%d hwq len%d bd prio%d len_mpdu%d seq_no%d skb_linked%p dma_mapping_addr%lld\n", sdr_compatible_str,
+          printk_ratelimited(KERN_WARNING "%s openwifi_tx_interrupt: WARNING wr%d rd%d last_bd_rd_idx%d i%d pkt_cnt%d prio%d fpga q%d hwq len%d bd prio%d len_mpdu%d seq_no%d skb_linked%p dma_mapping_addr%lld\n", sdr_compatible_str,
           ring->bd_wr_idx, ring->bd_rd_idx, last_bd_rd_idx, i, pkt_cnt, prio, queue_idx, hw_queue_len, ring->bds[ring->bd_rd_idx].prio, ring->bds[ring->bd_rd_idx].len_mpdu, seq_no, ring->bds[ring->bd_rd_idx].skb_linked, (long long int)(ring->bds[ring->bd_rd_idx].dma_mapping_addr));
           continue;
         }
@@ -836,17 +911,14 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
         ring->bds[ring->bd_rd_idx].dma_mapping_addr = 0;
       }
 
-      loop_count++;
+    loop_count++;
 
-      // printk("%s openwifi_tx_interrupt: loop %d prio %d rd %d\n", sdr_compatible_str, loop_count, prio, ring->bd_rd_idx);
-
-    } else
-      break;
+    // printk("%s openwifi_tx_interrupt: loop %d prio %d rd %d\n", sdr_compatible_str, loop_count, prio, ring->bd_rd_idx);
   }
   if ( loop_count!=1 && ((priv->drv_tx_reg_val[DRV_TX_REG_IDX_PRINT_CFG])&DMESG_LOG_ERROR) )
     printk("%s openwifi_tx_interrupt: WARNING loop_count %d\n", sdr_compatible_str, loop_count);
 
-  spin_unlock(&priv->lock);
+  spin_unlock_irqrestore(&priv->lock, flags);
   return IRQ_HANDLED;
 }
 
@@ -974,6 +1046,17 @@ inline void report_pkt_loss_due_to_driver_drop(struct ieee80211_hw *dev, struct 
   ieee80211_tx_status_irqsafe(dev, skb);
 }
 
+/* Test module only: make OPENWIFI_LOCK_SANITY=1. Not a substitute for lockdep. */
+static void openwifi_tx_lock_sanity(struct openwifi_priv *priv)
+{
+#ifdef OPENWIFI_LOCK_SANITY
+  if (irqs_disabled())
+    WARN_ON_ONCE(spin_is_locked(&priv->lock));
+#else
+  (void)priv;
+#endif
+}
+
 static void openwifi_tx(struct ieee80211_hw *dev,
            struct ieee80211_tx_control *control,
            struct sk_buff *skb)
@@ -996,6 +1079,16 @@ static void openwifi_tx(struct ieee80211_hw *dev,
   u32 dma_fifo_no_room_flag, hw_queue_len, delay_count=0;
   u16 aid = 0;
   enum dma_status status;
+  struct sk_buff *retire_skb[NUM_TX_BD];
+  dma_addr_t retire_dma[NUM_TX_BD];
+  unsigned int n_retire = 0;
+  int wake_queue_prio = -1;
+  int tx_drop_reason = 0;
+  int cookie_tries = 0;
+  bool tx_real_stop = false;
+  u32 snap_hwq = 0;
+  u8 snap_wr = 0, snap_rd = 0;
+  dma_cookie_t observed_cookie = 0;
 
   static u32 addr1_low32_prev = -1;
   static u8 rate_hw_value_prev = -1;
@@ -1049,6 +1142,13 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 
   ring = &(priv->tx_ring[drv_ring_idx]);
 
+  /*
+   * Hold priv->lock only to snapshot and detach BDs. printk, dma_unmap,
+   * ieee80211_tx_status_irqsafe and ieee80211_{wake,stop}_queue used to run
+   * inside this spin_lock_irqsave. A sleep there (console, mac80211 free,
+   * or GFP_KERNEL under the later prep) leaves the ticket owned by a task
+   * that is not on any CPU. Both waiters then spin with IRQs off.
+   */
   spin_lock_irqsave(&priv->lock, flags);
   if (ring->bds[ring->bd_wr_idx].seq_no != 0xffff) { // not cleared yet by interrupt
     for (i=1; i<NUM_TX_BD; i++) {
@@ -1058,6 +1158,9 @@ static void openwifi_tx(struct ieee80211_hw *dev,
       }
     }
     hw_queue_len = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read();
+    snap_hwq = hw_queue_len;
+    snap_wr = ring->bd_wr_idx;
+    snap_rd = ring->bd_rd_idx;
     if (empty_bd_idx) { // clear all bds before the empty bd and report failure to Linux
       if (priv->stat.stat_enable) {
         priv->stat.tx_prio_stop0_fake_num[prio]++;
@@ -1065,47 +1168,53 @@ static void openwifi_tx(struct ieee80211_hw *dev,
       }
       for (i=0; i<empty_bd_idx; i++) {
         j = ( (ring->bd_wr_idx+i)&(NUM_TX_BD-1) );
-        printk("%s openwifi_tx: WARNING fake stop queue empty_bd_idx%d i%d lnx prio%d map to q%d stop%d hwq len%d wr%d rd%d bd prio%d len_mpdu%d seq_no%d skb_linked%p dma_mapping_addr%lld\n", sdr_compatible_str,
-        empty_bd_idx, i, prio, drv_ring_idx, ring->stop_flag, hw_queue_len, ring->bd_wr_idx, ring->bd_rd_idx, ring->bds[j].prio, ring->bds[j].len_mpdu, ring->bds[j].seq_no, ring->bds[j].skb_linked,(long long int)(ring->bds[j].dma_mapping_addr));
-        // tell Linux this skb failed
-        skb_new = ring->bds[j].skb_linked;
-        dma_unmap_single(priv->tx_chan->device->dev,ring->bds[j].dma_mapping_addr,
-              skb_new->len, DMA_TO_DEVICE);
-        info_skipped = IEEE80211_SKB_CB(skb_new);
-        ieee80211_tx_info_clear_status(info_skipped);
-        info_skipped->status.rates[0].count = 1;
-        info_skipped->status.rates[1].idx = -1;
-        info_skipped->status.antenna = priv->runtime_tx_ant_cfg;
-        ieee80211_tx_status_irqsafe(dev, skb_new);
-
+        retire_skb[n_retire] = ring->bds[j].skb_linked;
+        retire_dma[n_retire] = ring->bds[j].dma_mapping_addr;
+        n_retire++;
         ring->bds[j].prio = 0xff; // invalid value
         ring->bds[j].len_mpdu = 0; // invalid value
         ring->bds[j].seq_no = 0xffff;
         ring->bds[j].skb_linked = NULL;
         ring->bds[j].dma_mapping_addr = 0;
-
       }
       if (ring->stop_flag != -1) { //the interrupt seems will never come, we need to wake up the queue in case the interrupt will never wake it up
-        ieee80211_wake_queue(dev, ring->stop_flag);
+        wake_queue_prio = ring->stop_flag;
         ring->stop_flag = -1;
       }
     } else {
-      j = ring->bd_wr_idx;
-      printk("%s openwifi_tx: WARNING real stop queue lnx prio%d map to q%d stop%d hwq len%d wr%d rd%d bd prio%d len_mpdu%d seq_no%d skb_linked%p dma_mapping_addr%lld\n", sdr_compatible_str,
-      prio, drv_ring_idx, ring->stop_flag, hw_queue_len, ring->bd_wr_idx, ring->bd_rd_idx, ring->bds[j].prio, ring->bds[j].len_mpdu, ring->bds[j].seq_no, ring->bds[j].skb_linked, (long long int)(ring->bds[j].dma_mapping_addr));
-
-      ieee80211_stop_queue(dev, prio); // here we should stop those prio related to the queue idx flag set in TX_INTF_REG_S_AXIS_FIFO_NO_ROOM_read
+      tx_real_stop = true;
       ring->stop_flag = prio;
       if (priv->stat.stat_enable) {
         priv->stat.tx_prio_stop0_real_num[prio]++;
         priv->stat.tx_queue_stop0_real_num[drv_ring_idx]++;
       }
-
-      spin_unlock_irqrestore(&priv->lock, flags);
-      goto openwifi_tx_early_out;
     }
   }
   spin_unlock_irqrestore(&priv->lock, flags);
+
+  if (tx_real_stop) {
+    printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING real stop queue lnx prio%d map to q%d hwq len%d wr%d rd%d\n",
+      sdr_compatible_str, prio, drv_ring_idx, snap_hwq, snap_wr, snap_rd);
+    ieee80211_stop_queue(dev, prio);
+    goto openwifi_tx_early_out;
+  }
+  for (i = 0; i < n_retire; i++) {
+    skb_new = retire_skb[i];
+    if (!skb_new)
+      continue;
+    printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING fake stop queue empty_bd_idx%d i%d lnx prio%d map to q%d hwq len%d wr%d rd%d skb%p\n",
+      sdr_compatible_str, empty_bd_idx, i, prio, drv_ring_idx, snap_hwq, snap_wr, snap_rd, skb_new);
+    dma_unmap_single(priv->tx_chan->device->dev, retire_dma[i],
+          skb_new->len, DMA_TO_DEVICE);
+    info_skipped = IEEE80211_SKB_CB(skb_new);
+    ieee80211_tx_info_clear_status(info_skipped);
+    info_skipped->status.rates[0].count = 1;
+    info_skipped->status.rates[1].idx = -1;
+    info_skipped->status.antenna = priv->runtime_tx_ant_cfg;
+    ieee80211_tx_status_irqsafe(dev, skb_new);
+  }
+  if (wake_queue_prio != -1)
+    ieee80211_wake_queue(dev, wake_queue_prio);
   // -------------------- end of Map Linux/SW "prio" to driver "drv_ring_idx" ------------------
 
   // get other info from packet header
@@ -1384,17 +1493,57 @@ static void openwifi_tx(struct ieee80211_hw *dev,
    */
   //wmb();
 
-  spin_lock_irqsave(&priv->lock, flags); // from now on, we'd better avoid interrupt because ring->stop_flag is shared with interrupt
+  /*
+   * Previous MM2S cookie, with IRQs enabled and priv->lock released.
+   * Sample the cookie under the lock. If it is still in flight, drop the
+   * lock, wait at most 100 * 4 us, then sample again. Two openwifi_tx
+   * callers share priv->tx_sg; a "complete" seen before the other CPU
+   * submits must not fall into prep/submit.
+   * Do not Idle-poll and do not dmaengine_terminate_sync(): that sleeps,
+   * and aborting a live MM2S drops the frame before tx_intf.
+   * Cookie completion is the DMA IRQ (SPI 35). The BD is reaped by the
+   * TX IRQ (SPI 34). Do not clear tx_cookie on timeout.
+   */
+openwifi_tx_wait_cookie:
+  if (cookie_tries++ > 4) {
+    printk_ratelimited(KERN_WARNING
+      "%s openwifi_tx: WARNING cookie still busy after retries — drop skb\n",
+      sdr_compatible_str);
+    goto openwifi_tx_early_out;
+  }
+  spin_lock_irqsave(&priv->lock, flags);
+  observed_cookie = priv->tx_cookie;
+  if (observed_cookie != 0) {
+    status = dma_async_is_tx_complete(priv->tx_chan, observed_cookie, NULL, NULL);
+    if (status != DMA_COMPLETE) {
+      spin_unlock_irqrestore(&priv->lock, flags);
+      delay_count = 0;
+      while (delay_count < 100 && status != DMA_COMPLETE) {
+        udelay(4);
+        if ((delay_count & 0x1f) == 0)
+          cond_resched();
+        delay_count++;
+        status = dma_async_is_tx_complete(priv->tx_chan, observed_cookie, NULL, NULL);
+      }
+      if (status != DMA_COMPLETE) {
+        printk_ratelimited(KERN_WARNING
+          "%s openwifi_tx: WARNING cookie not complete after %u us — drop skb\n",
+          sdr_compatible_str, delay_count * 4);
+        goto openwifi_tx_early_out;
+      }
+      goto openwifi_tx_wait_cookie;
+    }
+  }
+  /* priv->lock held. ring/stop_flag shared with the TX IRQ thread. */
 
   // -------------check whether FPGA dma fifo and queue (queue_idx) has enough room-------------
   dma_fifo_no_room_flag = tx_intf_api->TX_INTF_REG_S_AXIS_FIFO_NO_ROOM_read();
   hw_queue_len = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read();
   if ( ((dma_fifo_no_room_flag>>queue_idx)&1) || ((NUM_TX_BD-((hw_queue_len>>(queue_idx*8))&0xFF))<=RING_ROOM_THRESHOLD)  || ring->stop_flag>=0 ) {
-    if( priv->drv_tx_reg_val[DRV_TX_REG_IDX_PRINT_CFG]&DMESG_LOG_NORMAL_QUEUE_STOP )
-      printk("%s openwifi_tx: WARNING ieee80211_stop_queue prio%d queue%d no room flag%x hwq len%08x request%d wr%d rd%d\n", sdr_compatible_str,
-              prio, queue_idx, dma_fifo_no_room_flag, hw_queue_len, num_dma_symbol, ring->bd_wr_idx, ring->bd_rd_idx);
-
-    ieee80211_stop_queue(dev, prio); // here we should stop those prio related to the queue idx flag set in TX_INTF_REG_S_AXIS_FIFO_NO_ROOM_read
+    tx_real_stop = true; // reused as "call ieee80211_stop_queue after unlock"
+    snap_hwq = hw_queue_len;
+    snap_wr = ring->bd_wr_idx;
+    snap_rd = ring->bd_rd_idx;
     ring->stop_flag = prio;
     if (priv->stat.stat_enable) {
       priv->stat.tx_prio_stop1_num[prio]++;
@@ -1404,25 +1553,14 @@ static void openwifi_tx(struct ieee80211_hw *dev,
   }
   // --------end of check whether FPGA fifo (queue_idx) has enough room------------
 
-  status = dma_async_is_tx_complete(priv->tx_chan, priv->tx_cookie, NULL, NULL);
-  while(delay_count<100 && status!=DMA_COMPLETE) {
-    status = dma_async_is_tx_complete(priv->tx_chan, priv->tx_cookie, NULL, NULL);
-    delay_count++;
-    udelay(4);
-    // udelay(priv->stat.dbg_ch1);
-  }
-  if (status!=DMA_COMPLETE) {
-    printk("%s openwifi_tx: WARNING status!=DMA_COMPLETE\n", sdr_compatible_str);
-    goto openwifi_tx_early_out_after_lock;
-  }
-
 //-------------------------fire skb DMA to hardware----------------------------------
   dma_mapping_addr = dma_map_single(priv->tx_chan->device->dev, dma_buf,
          num_dma_byte, DMA_TO_DEVICE);
 
   if (dma_mapping_error(priv->tx_chan->device->dev,dma_mapping_addr)) {
     // dev_err(priv->tx_chan->device->dev, "sdr,sdr openwifi_tx: WARNING TX DMA mapping error\n");
-    printk("%s openwifi_tx: WARNING sn %d TX DMA mapping error\n", sdr_compatible_str, ring->bd_wr_idx);
+    tx_drop_reason = 1;
+    snap_wr = ring->bd_wr_idx;
     goto openwifi_tx_early_out_after_lock;
   }
 
@@ -1435,14 +1573,16 @@ static void openwifi_tx(struct ieee80211_hw *dev,
   tx_intf_api->TX_INTF_REG_PHY_HDR_CONFIG_write(phy_hdr_config);
   priv->txd = priv->tx_chan->device->device_prep_slave_sg(priv->tx_chan, &(priv->tx_sg),1,DMA_MEM_TO_DEV, DMA_CTRL_ACK | DMA_PREP_INTERRUPT, NULL);
   if (!(priv->txd)) {
-    printk("%s openwifi_tx: WARNING sn %d device_prep_slave_sg %p\n", sdr_compatible_str, ring->bd_wr_idx, (void*)(priv->txd));
+    tx_drop_reason = 2;
+    snap_wr = ring->bd_wr_idx;
     goto openwifi_tx_after_dma_mapping;
   }
 
   priv->tx_cookie = priv->txd->tx_submit(priv->txd);
 
   if (dma_submit_error(priv->tx_cookie)) {
-    printk("%s openwifi_tx: WARNING sn %d dma_submit_error(tx_cookie) %d\n", sdr_compatible_str, ring->bd_wr_idx, (u32)(priv->tx_cookie));
+    tx_drop_reason = 3;
+    snap_wr = ring->bd_wr_idx;
     goto openwifi_tx_after_dma_mapping;
   }
 
@@ -1459,11 +1599,19 @@ static void openwifi_tx(struct ieee80211_hw *dev,
 
   spin_unlock_irqrestore(&priv->lock, flags);
 
+  if (tx_real_stop) {
+    if (priv->drv_tx_reg_val[DRV_TX_REG_IDX_PRINT_CFG] & DMESG_LOG_NORMAL_QUEUE_STOP)
+      printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING ieee80211_stop_queue prio%d queue%d hwq len%08x request%d wr%d rd%d\n",
+              sdr_compatible_str, prio, queue_idx, snap_hwq, num_dma_symbol, snap_wr, snap_rd);
+    ieee80211_stop_queue(dev, prio);
+  }
+
   if (priv->stat.stat_enable) {
     priv->stat.tx_prio_num[prio]++;
     priv->stat.tx_queue_num[queue_idx]++;
   }
 
+  openwifi_tx_lock_sanity(priv);
   return;
 
 openwifi_tx_after_dma_mapping:
@@ -1471,15 +1619,25 @@ openwifi_tx_after_dma_mapping:
 
 openwifi_tx_early_out_after_lock:
   spin_unlock_irqrestore(&priv->lock, flags);
+  if (tx_drop_reason == 1)
+    printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING sn %d TX DMA mapping error\n", sdr_compatible_str, snap_wr);
+  else if (tx_drop_reason == 2)
+    printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING sn %d device_prep_slave_sg failed\n", sdr_compatible_str, snap_wr);
+  else if (tx_drop_reason == 3)
+    printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING sn %d dma_submit_error(tx_cookie) %d\n", sdr_compatible_str, snap_wr, (u32)(priv->tx_cookie));
+  if (tx_real_stop)
+    ieee80211_stop_queue(dev, prio);
   report_pkt_loss_due_to_driver_drop(dev, skb);
   // dev_kfree_skb(skb);
   // printk("%s openwifi_tx: WARNING openwifi_tx_after_dma_mapping phy_tx_sn %d queue %d\n", sdr_compatible_str,priv->phy_tx_sn,queue_idx);
+  openwifi_tx_lock_sanity(priv);
   return;
 
 openwifi_tx_early_out:
   report_pkt_loss_due_to_driver_drop(dev, skb);
   // dev_kfree_skb(skb);
   // printk("%s openwifi_tx: WARNING openwifi_tx_early_out phy_tx_sn %d queue %d\n", sdr_compatible_str,priv->phy_tx_sn,queue_idx);
+  openwifi_tx_lock_sanity(priv);
 }
 
 static int openwifi_set_antenna(struct ieee80211_hw *dev, u32 tx_ant, u32 rx_ant)
@@ -1589,11 +1747,51 @@ static int openwifi_get_antenna(struct ieee80211_hw *dev, u32 *tx_ant, u32 *rx_a
   return 0;
 }
 
+/*
+ * Deferred IRQ arm: run after openwifi_start returns so udev/mac80211 are not
+ * racing level-triggered handlers. Order:
+ *   1) enable_irq (FPGA sources still masked → no pending fabric IRQ)
+ *   2) unmask FPGA RX/TX
+ *   3) set irq_armed so handlers process packets
+ */
+static void openwifi_irq_arm_workfn(struct work_struct *work)
+{
+  struct openwifi_priv *priv =
+    container_of(to_delayed_work(work), struct openwifi_priv, irq_arm_work);
+
+  if (!priv->irq_requested || priv->irq_rx <= 0 || priv->irq_tx <= 0) {
+    printk(KERN_WARNING "%s irq_arm: IRQs not requested — skip\n",
+           sdr_compatible_str);
+    return;
+  }
+
+  /* GIC enable while FPGA still masked */
+  enable_irq(priv->irq_rx);
+  enable_irq(priv->irq_tx);
+  printk(KERN_INFO
+         "%s irq_arm: enable_irq RX=%d TX=%d (FPGA still masked)\n",
+         sdr_compatible_str, priv->irq_rx, priv->irq_tx);
+
+  /* Unmask fabric sources last */
+  rx_intf_api->RX_INTF_REG_INTERRUPT_TEST_write(0x000);
+  tx_intf_api->TX_INTF_REG_INTERRUPT_SEL_write(0x4);
+  WRITE_ONCE(priv->irq_armed, true);
+
+  printk(KERN_INFO
+         "%s irq_arm: FPGA unmasked, irq_armed=1 — SoftMAC IRQs live\n",
+         sdr_compatible_str);
+}
+
 static int openwifi_start(struct ieee80211_hw *dev)
 {
   struct openwifi_priv *priv = dev->priv;
   int ret, i;
   u32 reg;
+
+  /* Re-start: cancel any pending arm from a previous open */
+  WRITE_ONCE(priv->irq_armed, false);
+  cancel_delayed_work_sync(&priv->irq_arm_work);
+  priv->irq_requested = false;
 
   for (i=0; i<MAX_NUM_VIF; i++) {
     priv->vif[i] = NULL;
@@ -1652,6 +1850,13 @@ static int openwifi_start(struct ieee80211_hw *dev)
   }
   printk("%s openwifi_start: DMA channel setup successfully. priv->rx_chan 0x%p priv->tx_chan 0x%p\n",sdr_compatible_str, priv->rx_chan, priv->tx_chan);
 
+  /* Map TX AXI DMA MM2S regs for Idle/IOC poll (SPI53 IRQ often silent) */
+  if (!priv->tx_dma_regs)
+    priv->tx_dma_regs = ioremap(0x80400000, 0x100);
+  if (!priv->tx_dma_regs)
+    printk(KERN_WARNING "%s openwifi_start: ioremap TX DMA failed — no HW poll\n",
+           sdr_compatible_str);
+
   ret = openwifi_init_rx_ring(priv);
   if (ret) {
     printk("%s openwifi_start: openwifi_init_rx_ring ret %d\n", sdr_compatible_str,ret);
@@ -1671,28 +1876,134 @@ static int openwifi_start(struct ieee80211_hw *dev)
     goto err_free_rings;
   }
 
-  priv->irq_rx = irq_of_parse_and_map(priv->pdev->dev.of_node, 1);
-  ret = request_irq(priv->irq_rx, openwifi_rx_interrupt,
-      IRQF_SHARED, "sdr,rx_pkt_intr", dev);
-  if (ret) {
-    wiphy_err(dev->wiphy, "openwifi_start:failed to register IRQ handler openwifi_rx_interrupt\n");
+  /*
+   * Resolve IRQs by name first (robust), then fall back to fixed indices
+   * used by upstream openwifi: index 1 = RX, index 3 = TX.
+   *
+   * Hardware (sys_concat_intc, F2P REVERSE) — see openwifi.dtsi:
+   *   In1 rx_pkt_intr → SPI 30
+   *   In5 tx_itrpt    → SPI 34
+   *   In6/7 dma0      → SPI 35/36
+   * The old "SPI = 59 − n" expectation (RX 58 / TX 54) was wrong.
+   * DT must use EDGE_RISING for SoftMAC (sticky LEVEL re-enters forever).
+   */
+  priv->irq_rx = of_irq_get_byname(priv->pdev->dev.of_node, "rx_pkt_intr");
+  if (priv->irq_rx <= 0)
+    priv->irq_rx = irq_of_parse_and_map(priv->pdev->dev.of_node, 1);
+
+  priv->irq_tx = of_irq_get_byname(priv->pdev->dev.of_node, "tx_itrpt");
+  if (priv->irq_tx <= 0)
+    priv->irq_tx = irq_of_parse_and_map(priv->pdev->dev.of_node, 3);
+
+  printk(KERN_INFO "%s openwifi_start: resolved irq_rx=%d irq_tx=%d irq_mode=%d\n",
+         sdr_compatible_str, priv->irq_rx, priv->irq_tx, irq_mode);
+  printk(KERN_INFO
+         "%s openwifi_start: expect RX=SPI30 TX=SPI34\n",
+         sdr_compatible_str);
+
+  if (priv->irq_rx <= 0 || priv->irq_tx <= 0) {
+    printk(KERN_ERR "%s openwifi_start: invalid IRQ (rx=%d tx=%d) — check DT SPI map\n",
+           sdr_compatible_str, priv->irq_rx, priv->irq_tx);
+    ret = -EINVAL;
     goto err_free_rings;
-  } else {
-    printk("%s openwifi_start: irq_rx %d\n", sdr_compatible_str, priv->irq_rx);
+  }
+  if (priv->irq_rx == priv->irq_tx) {
+    printk(KERN_ERR "%s openwifi_start: RX and TX share virq %d — DT bug\n",
+           sdr_compatible_str, priv->irq_rx);
+    ret = -EINVAL;
+    goto err_free_rings;
   }
 
-  priv->irq_tx = irq_of_parse_and_map(priv->pdev->dev.of_node, 3);
-  ret = request_irq(priv->irq_tx, openwifi_tx_interrupt,
-      IRQF_SHARED, "sdr,tx_itrpt", dev);
-  if (ret) {
-    wiphy_err(dev->wiphy, "openwifi_start: failed to register IRQ handler openwifi_tx_interrupt\n");
+  /* Recovery: never call request_irq — keep system responsive */
+  if (irq_mode == 0) {
+    printk(KERN_WARNING
+           "%s openwifi_start: irq_mode=0 — skipping request_irq (wlan stays down)\n",
+           sdr_compatible_str);
+    ret = -EOPNOTSUPP;
     goto err_free_rings;
-  } else {
-    printk("%s openwifi_start: irq_tx %d\n", sdr_compatible_str, priv->irq_tx);
   }
 
-  rx_intf_api->RX_INTF_REG_INTERRUPT_TEST_write(0x000); // enable rx interrupt get normal fcs valid pass through ddc to ARM
-  tx_intf_api->TX_INTF_REG_INTERRUPT_SEL_write(0x4); //enable tx interrupt
+  /*
+   * FPGA RX/TX sources are still masked (written earlier).
+   *
+   * Default (irq_mode=1):
+   *  request_threaded_irq(..., IRQF_ONESHOT | IRQF_NO_AUTOEN)
+   *   - exclusive (not SHARED) so NO_AUTOEN is legal
+   *   - ONESHOT: level line stays masked while thread runs → no hardirq storm
+   *   - handlers run in process context → no RCU stall from long hardirq work
+   *  Then: return from start(); deferred work does enable_irq + FPGA unmask.
+   */
+  {
+    unsigned long irqflags;
+
+    if (irq_mode == 2) {
+      printk(KERN_WARNING
+             "%s openwifi_start: irq_mode=2 LEGACY SHARED hardirq (may hang)\n",
+             sdr_compatible_str);
+      irqflags = IRQF_SHARED;
+    } else {
+      irqflags = IRQF_ONESHOT | IRQF_NO_AUTOEN;
+    }
+
+    if (irq_has_action(priv->irq_rx)) {
+      printk(KERN_ERR
+             "%s openwifi_start: RX virq %d already has a handler — refuse\n",
+             sdr_compatible_str, priv->irq_rx);
+      ret = -EBUSY;
+      goto err_free_rings;
+    }
+    if (irq_has_action(priv->irq_tx)) {
+      printk(KERN_ERR
+             "%s openwifi_start: TX virq %d already has a handler — refuse\n",
+             sdr_compatible_str, priv->irq_tx);
+      ret = -EBUSY;
+      goto err_free_rings;
+    }
+
+    printk(KERN_INFO
+           "%s openwifi_start: request IRQs flags=0x%lx (ONESHOT=0x%x NO_AUTOEN=0x%x)\n",
+           sdr_compatible_str, irqflags, IRQF_ONESHOT, IRQF_NO_AUTOEN);
+
+    if (irq_mode == 2) {
+      ret = request_irq(priv->irq_rx, openwifi_rx_interrupt,
+			irqflags, "sdr,rx_pkt_intr", dev);
+    } else {
+      ret = request_threaded_irq(priv->irq_rx, NULL, openwifi_rx_interrupt,
+				 irqflags, "sdr,rx_pkt_intr", dev);
+    }
+    if (ret) {
+      printk(KERN_ERR "%s openwifi_start: request_irq RX virq %d failed %d\n",
+             sdr_compatible_str, priv->irq_rx, ret);
+      priv->irq_rx = 0;
+      priv->irq_tx = 0;
+      goto err_free_rings;
+    }
+    printk(KERN_INFO
+           "%s openwifi_start: request_irq RX virq %d OK (line left disabled)\n",
+           sdr_compatible_str, priv->irq_rx);
+
+    if (irq_mode == 2) {
+      ret = request_irq(priv->irq_tx, openwifi_tx_interrupt,
+			irqflags, "sdr,tx_itrpt", dev);
+    } else {
+      ret = request_threaded_irq(priv->irq_tx, NULL, openwifi_tx_interrupt,
+				 irqflags, "sdr,tx_itrpt", dev);
+    }
+    if (ret) {
+      printk(KERN_ERR "%s openwifi_start: request_irq TX virq %d failed %d\n",
+             sdr_compatible_str, priv->irq_tx, ret);
+      free_irq(priv->irq_rx, dev);
+      priv->irq_rx = 0;
+      priv->irq_tx = 0;
+      goto err_free_rings;
+    }
+    printk(KERN_INFO
+           "%s openwifi_start: request_irq TX virq %d OK (line left disabled)\n",
+           sdr_compatible_str, priv->irq_tx);
+    priv->irq_requested = true;
+  }
+
+  /* Release DMA path / TSF — keep FPGA IRQ sources masked until arm work */
   rx_intf_api->RX_INTF_REG_M_AXIS_RST_write(0); // release M AXIS
   xpu_api->XPU_REG_TSF_LOAD_VAL_write(0,0); // reset tsf timer
 
@@ -1703,17 +2014,56 @@ static int openwifi_start(struct ieee80211_hw *dev)
   priv->ad9361_phy->state->manual_tx_quad_cal_en = true;  // turn on manual Tx quadrature calib.
   xpu_api->XPU_REG_SPI_DISABLE_write(0);
 
+  /*
+   * Sequence (safety):
+   *  mask FPGA → request(NO_AUTOEN) → [start returns] →
+   *  enable_irq (FPGA still masked) → unmask FPGA → irq_armed=1
+   *
+   * Deferred so udev/mac80211 open path is not racing hardirq handlers.
+   */
+  WRITE_ONCE(priv->irq_armed, false);
+  if (irq_mode == 2) {
+    /* Legacy: enable immediately (unsafe) */
+    rx_intf_api->RX_INTF_REG_INTERRUPT_TEST_write(0x000);
+    tx_intf_api->TX_INTF_REG_INTERRUPT_SEL_write(0x4);
+    WRITE_ONCE(priv->irq_armed, true);
+    printk(KERN_WARNING "%s openwifi_start: legacy path — FPGA unmasked immediately\n",
+           sdr_compatible_str);
+  } else {
+    int delay = irq_arm_delay_ms > 0 ? irq_arm_delay_ms : 100;
+
+    /* Ensure FPGA sources stay masked until arm work */
+    tx_intf_api->TX_INTF_REG_INTERRUPT_SEL_write(0x30004);
+    rx_intf_api->RX_INTF_REG_INTERRUPT_TEST_write(0x100);
+    schedule_delayed_work(&priv->irq_arm_work, msecs_to_jiffies(delay));
+    printk(KERN_INFO
+           "%s openwifi_start: scheduled IRQ arm in %d ms (FPGA still masked)\n",
+           sdr_compatible_str, delay);
+  }
+
 // normal_out:
-  printk("%s openwifi_start: normal end\n", sdr_compatible_str);
+  printk("%s openwifi_start: normal end irq_rx=%d irq_tx=%d irq_mode=%d (arm deferred)\n",
+         sdr_compatible_str, priv->irq_rx, priv->irq_tx, irq_mode);
   return 0;
 
 err_free_rings:
   openwifi_free_rx_ring(priv);
   for (i=0; i<MAX_NUM_SW_QUEUE; i++)
     openwifi_free_tx_ring(priv, i);
-
+  /* Fall through: always release DMA channels after a failed start */
 err_dma:
-  ret = -1;
+  if (!IS_ERR_OR_NULL(priv->rx_chan)) {
+    dmaengine_terminate_all(priv->rx_chan);
+    dma_release_channel(priv->rx_chan);
+    priv->rx_chan = NULL;
+  }
+  if (!IS_ERR_OR_NULL(priv->tx_chan)) {
+    dmaengine_terminate_all(priv->tx_chan);
+    dma_release_channel(priv->tx_chan);
+    priv->tx_chan = NULL;
+  }
+  if (ret >= 0)
+    ret = -1;
   printk("%s openwifi_start: abnormal end ret %d\n", sdr_compatible_str, ret);
   return ret;
 }
@@ -1723,6 +2073,10 @@ static void openwifi_stop(struct ieee80211_hw *dev, bool suspend)
   struct openwifi_priv *priv = dev->priv;
   u32 reg, reg1;
   int i;
+
+  /* Disarm first — cancel deferred enable and silence handlers */
+  WRITE_ONCE(priv->irq_armed, false);
+  cancel_delayed_work_sync(&priv->irq_arm_work);
 
   // enable ad9361 auto calibration and disable openwifi fpga spi control
   priv->ad9361_phy->state->auto_cal_en = true;   // turn on auto Tx quadrature calib.
@@ -1761,11 +2115,23 @@ static void openwifi_stop(struct ieee80211_hw *dev, bool suspend)
   pr_info("%s openwifi_stop: dropped channel %s\n", sdr_compatible_str, dma_chan_name(priv->tx_chan));
   dmaengine_terminate_all(priv->tx_chan);
   dma_release_channel(priv->tx_chan);
+  priv->tx_cookie = 0;
+  if (priv->tx_dma_regs) {
+    iounmap(priv->tx_dma_regs);
+    priv->tx_dma_regs = NULL;
+  }
 
   //priv->rf->stop(dev);
 
-  free_irq(priv->irq_rx, dev);
-  free_irq(priv->irq_tx, dev);
+  if (priv->irq_rx > 0) {
+    free_irq(priv->irq_rx, dev);
+    priv->irq_rx = 0;
+  }
+  if (priv->irq_tx > 0) {
+    free_irq(priv->irq_tx, dev);
+    priv->irq_tx = 0;
+  }
+  priv->irq_requested = false;
 
 // normal_out:
   printk("%s openwifi_stop\n", sdr_compatible_str);
@@ -2577,6 +2943,10 @@ static int openwifi_dev_probe(struct platform_device *pdev)
   SET_IEEE80211_PERM_ADDR(dev, priv->mac_addr);
 
   spin_lock_init(&priv->lock);
+  priv->hw = dev;
+  priv->irq_armed = false;
+  priv->irq_requested = false;
+  INIT_DELAYED_WORK(&priv->irq_arm_work, openwifi_irq_arm_workfn);
 
   err = ieee80211_register_hw(dev);
   if (err) {

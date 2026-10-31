@@ -15,7 +15,7 @@ ch_number=$2
 echo $nic_name
 echo $ch_number
 
-if [ -f /etc/openwrt_release ]; then
+if [ -f /etc/openwrt_release ] || ! command -v iwconfig >/dev/null 2>&1; then
   ip link set $nic_name down
   iw dev $nic_name set type monitor
   ip link set $nic_name up

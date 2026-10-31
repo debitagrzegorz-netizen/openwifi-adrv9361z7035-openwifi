@@ -483,6 +483,11 @@ struct openwifi_priv {
 
   int irq_rx;
   int irq_tx;
+  /* false until deferred arm work unmasks FPGA + enable_irq (post-start) */
+  bool irq_armed;
+  bool irq_requested;
+  struct delayed_work irq_arm_work;
+  struct ieee80211_hw *hw; /* back-pointer for delayed IRQ arm work */
 
   // u32 call_counter;
   u8                             *rx_cyclic_buf;
@@ -496,6 +501,8 @@ struct openwifi_priv {
   struct dma_chan                *tx_chan;
   struct dma_async_tx_descriptor *txd;
   dma_cookie_t                   tx_cookie;
+  /* MM2S register window (tx AXI DMA @ 0x80400000) — poll Idle/IOC when SPI53 IRQ silent */
+  void __iomem                   *tx_dma_regs;
   // struct completion tx_dma_complete;
   // bool openwifi_tx_first_time_run;
 
