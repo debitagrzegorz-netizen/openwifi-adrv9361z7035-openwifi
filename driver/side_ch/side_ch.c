@@ -362,10 +362,18 @@ static int get_side_info(int num_eq, int iq_len) {
 		return(-1);
 	}
 
-	status = dma_async_is_tx_complete(chan_to_ps, chan_to_ps_cookie, NULL, NULL);
-	if (status!=DMA_COMPLETE) {
-		printk("%s get_side_info WARNING status!=DMA_COMPLETE\n", side_ch_compatible_str);
-		return(-1);
+	/*
+	 * chan_to_ps_cookie is 0 until the first submit. On kernel 6.12,
+	 * dma_async_is_tx_complete(cookie 0) is not DMA_COMPLETE, so the
+	 * original check returned before any descriptor was queued.
+	 * Skip it only when no transfer has been submitted.
+	 */
+	if (chan_to_ps_cookie != 0) {
+		status = dma_async_is_tx_complete(chan_to_ps, chan_to_ps_cookie, NULL, NULL);
+		if (status!=DMA_COMPLETE) {
+			printk("%s get_side_info WARNING status!=DMA_COMPLETE (%d)\n", side_ch_compatible_str, status);
+			return(-1);
+		}
 	}
 
 	set_user_nice(current, 10);
@@ -603,11 +611,15 @@ static int dev_probe(struct platform_device *pdev) {
 	chan_to_ps = dma_request_chan(&(pdev->dev), "tx_dma_s2mm");
 	if (IS_ERR(chan_to_ps) || chan_to_ps==NULL) {
 		err = PTR_ERR(chan_to_ps);
-		if (err != -EPROBE_DEFER) {
-			pr_err("%s dev_probe: No chan_to_ps ret %d chan_to_ps 0x%p\n",side_ch_compatible_str, err, chan_to_ps);
-			goto free_chan_to_ps;
-		}
+		pr_err("%s dev_probe: No chan_to_ps ret %d chan_to_ps 0x%p\n",side_ch_compatible_str, err, chan_to_ps);
+		/* ERR_PTR must not be passed to dma_release_channel. */
+		chan_to_ps = NULL;
+		netlink_kernel_release(nl_sk);
+		nl_sk = NULL;
+		return err;
 	}
+	/* A previous insmod leaves this global cookie non-zero. */
+	chan_to_ps_cookie = 0;
 
 	printk("%s dev_probe: DMA channel setup successfully. chan_to_pl 0x%p chan_to_ps 0x%p\n",side_ch_compatible_str, chan_to_pl, chan_to_ps);
 
@@ -616,19 +628,15 @@ static int dev_probe(struct platform_device *pdev) {
 
 	err = init_side_channel();
 	printk("%s dev_probe: init_side_channel() err %d\n",side_ch_compatible_str, err);
+	if (err) {
+		dma_release_channel(chan_to_ps);
+		chan_to_ps = NULL;
+		netlink_kernel_release(nl_sk);
+		nl_sk = NULL;
+		return err;
+	}
 
-	return(err);
-
-	// err = dma_loopback_test(7, 512);
-	// if (err == 0)
-	// 	return(err);
-	// else
-	// 	dma_release_channel(chan_to_ps);
-
-free_chan_to_ps:
-	err = -2;
-	dma_release_channel(chan_to_ps);
-	return err;
+	return 0;
 
 // free_chan_to_pl:
 // 	err = -1;
@@ -655,11 +663,17 @@ static void dev_remove(struct platform_device *pdev)
 	// }
 
 	pr_info("%s dev_remove: dropped chan_to_ps 0x%p\n", side_ch_compatible_str, chan_to_ps);
-	if (chan_to_pl != NULL) {
+	/* Author code tested chan_to_pl, which is never requested, so the
+	 * S2MM channel was leaked and the next insmod called
+	 * dma_release_channel on an ERR_PTR. Release the channel we own.
+	 * Do not dmaengine_terminate_all: axi_dma_0 is shared with sdr TX.
+	 */
+	if (!IS_ERR_OR_NULL(chan_to_ps)) {
 		pr_info("%s dev_remove: dropped channel %s\n", side_ch_compatible_str, dma_chan_name(chan_to_ps));
-		// dmaengine_terminate_all(chan_to_ps); //this also terminate sdr.ko. do not use
 		dma_release_channel(chan_to_ps);
+		chan_to_ps = NULL;
 	}
+	chan_to_ps_cookie = 0;
 
 	if (side_info_buf != NULL)
 		kfree(side_info_buf);

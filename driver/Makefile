@@ -1,6 +1,6 @@
 # Xianjun jiao. putaoshu@msn.com; xianjun.jiao@imec.be
 
-obj-m += sdr.o openofdm_rx/openofdm_rx.o openofdm_tx/openofdm_tx.o tx_intf/tx_intf.o rx_intf/rx_intf.o xpu/xpu.o
+obj-m += sdr.o openofdm_rx/openofdm_rx.o openofdm_tx/openofdm_tx.o tx_intf/tx_intf.o rx_intf/rx_intf.o xpu/xpu.o side_ch/side_ch.o
 
 # Test builds only: make OPENWIFI_LOCK_SANITY=1
 # Warns if openwifi_tx returns with priv->lock still held and IRQs off.
