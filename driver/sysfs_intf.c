@@ -1161,8 +1161,69 @@ static ssize_t dbg_ch2_store(struct device *input_dev, struct device_attribute *
 	return ret ? ret : len;
 }
 
+static ssize_t tx_stall_stat_show(struct device *input_dev, struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(input_dev);
+	struct ieee80211_hw *dev = platform_get_drvdata(pdev);
+	struct openwifi_priv *priv = dev->priv;
+	struct openwifi_txwd *wd = &priv->txwd;
+
+	return sprintf(buf, "late_wake %u %u %u %u\nnet_wake %u %u %u %u\nstall_detect %u\nstall_recover %u\nbusy_ticks %u\nskip_dma_busy %u\nretired %u\nlast_detect_ms %u\nlast_test_ms %u\ntest_armed %u\n",
+		wd->late_wake[0], wd->late_wake[1], wd->late_wake[2], wd->late_wake[3],
+		wd->net_wake[0], wd->net_wake[1], wd->net_wake[2], wd->net_wake[3],
+		wd->stall_detect, wd->stall_recover, wd->busy_ticks, wd->skip_dma_busy,
+		wd->retired, wd->last_detect_ms, wd->last_test_ms, wd->test_armed);
+}
+static ssize_t tx_stall_stat_store(struct device *input_dev, struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct platform_device *pdev = to_platform_device(input_dev);
+	struct ieee80211_hw *dev = platform_get_drvdata(pdev);
+	struct openwifi_priv *priv = dev->priv;
+	struct openwifi_txwd *wd = &priv->txwd;
+	int i;
+
+	for (i=0; i<MAX_NUM_SW_QUEUE; i++) {
+		wd->late_wake[i] = 0;
+		wd->net_wake[i] = 0;
+	}
+	wd->stall_detect = 0;
+	wd->stall_recover = 0;
+	wd->busy_ticks = 0;
+	wd->skip_dma_busy = 0;
+	wd->retired = 0;
+	wd->last_detect_ms = 0;
+	wd->last_test_ms = 0;
+	return len;
+}
+
+/* Test only: close every time slice so no queue may transmit while the medium
+ * stays idle (the P26 FPGA-freeze condition). The TX watchdog recovery opens
+ * the slices again and records the block-to-recovery time in last_test_ms. */
+static ssize_t tx_stall_test_store(struct device *input_dev, struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct platform_device *pdev = to_platform_device(input_dev);
+	struct ieee80211_hw *dev = platform_get_drvdata(pdev);
+	struct openwifi_priv *priv = dev->priv;
+	unsigned long flags;
+	long readin;
+	int i;
+	u32 ret = kstrtol(buf, 10, &readin);
+
+	if (ret || readin != 1)
+		return ret ? ret : len;
+	spin_lock_irqsave(&priv->lock, flags);
+	priv->txwd.test_start = jiffies;
+	priv->txwd.test_armed = true;
+	for (i=0; i<4; i++)
+		xpu_api->XPU_REG_SLICE_COUNT_END_write((i<<20)|0);
+	spin_unlock_irqrestore(&priv->lock, flags);
+	return len;
+}
+
 static DEVICE_ATTR(stat_enable, S_IRUGO | S_IWUSR, stat_enable_show, stat_enable_store);
 static DEVICE_ATTR(tx_prio_queue, S_IRUGO | S_IWUSR, tx_prio_queue_show, tx_prio_queue_store);
+static DEVICE_ATTR(tx_stall_stat, S_IRUGO | S_IWUSR, tx_stall_stat_show, tx_stall_stat_store);
+static DEVICE_ATTR(tx_stall_test, S_IWUSR, NULL, tx_stall_test_store);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_total, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_total_show, tx_data_pkt_need_ack_num_total_store);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_total_fail, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_total_fail_show, tx_data_pkt_need_ack_num_total_fail_store);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_retx, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_retx_show, tx_data_pkt_need_ack_num_retx_store);
@@ -1213,6 +1274,8 @@ static struct attribute *stat_attributes[] = {
 	&dev_attr_stat_enable.attr,
 
 	&dev_attr_tx_prio_queue.attr,
+	&dev_attr_tx_stall_stat.attr,
+	&dev_attr_tx_stall_test.attr,
 
 	&dev_attr_tx_data_pkt_need_ack_num_total.attr,
 	&dev_attr_tx_data_pkt_need_ack_num_total_fail.attr,

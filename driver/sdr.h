@@ -442,6 +442,34 @@ struct openwifi_stat {
   u32 dbg_ch2;
 };
 
+/*
+ * TX stall handling (P26c). late_wake: wakes issued by the re-check after a
+ * stop that raced with a TX completion. net_wake: wakes by the watchdog for
+ * a stopped queue that has room again. A stall is pending FPGA frames with no
+ * TX completion while the medium is idle; recovery resets the TX path and
+ * hands the stuck frames back to mac80211 as failed.
+ */
+struct openwifi_txwd {
+  struct delayed_work work;
+  bool run;
+  u32 done;           /* TX completions seen by the IRQ handler */
+  u32 last_done;
+  u32 still_ms;       /* time with frames pending, no completion, medium idle */
+  u32 late_wake[MAX_NUM_SW_QUEUE];
+  u32 net_wake[MAX_NUM_SW_QUEUE];
+  u32 stall_detect;
+  u32 stall_recover;
+  u32 busy_ticks;     /* frames pending, no completion, medium busy */
+  u32 skip_dma_busy;  /* stall seen but TX DMA not idle: recovery deferred */
+  u32 retired;        /* frames returned to mac80211 by a recovery */
+  u32 last_detect_ms; /* still_ms when the last recovery started */
+  bool test_armed;    /* tx_stall_test blocked the time slices */
+  unsigned long test_start;
+  u32 last_test_ms;   /* tx_stall_test: block to recovery */
+  struct sk_buff *retire_skb[MAX_NUM_SW_QUEUE*NUM_TX_BD];
+  dma_addr_t retire_dma[MAX_NUM_SW_QUEUE*NUM_TX_BD];
+};
+
 #define RX_DMA_CYCLIC_MODE
 struct openwifi_priv {
   struct platform_device       *pdev;
@@ -529,6 +557,7 @@ struct openwifi_priv {
   u8                   tx_intf_iq_ctl;
 
   struct openwifi_stat stat;
+  struct openwifi_txwd txwd;
   // u8 num_led;
   // struct led_classdev *led[MAX_NUM_LED];//zc706 has 4 user leds. please find openwifi_dev_probe to see how we get them.
   // char led_name[MAX_NUM_LED][OPENWIFI_LED_MAX_NAME_LEN];

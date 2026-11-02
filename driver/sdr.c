@@ -145,6 +145,15 @@ module_param(irq_arm_delay_ms, int, 0644);
 MODULE_PARM_DESC(irq_arm_delay_ms,
 	"ms after openwifi_start before enable_irq+FPGA unmask (default 100)");
 
+/* P26c TX watchdog: check period, and how long frames may wait in the FPGA
+ * queue with no TX completion while the medium is idle before recovery. */
+static int tx_wd_period_ms = 250;
+module_param(tx_wd_period_ms, int, 0644);
+MODULE_PARM_DESC(tx_wd_period_ms, "TX watchdog period in ms, 0 disables (default 250)");
+static int tx_wd_stall_ms = 1000;
+module_param(tx_wd_stall_ms, int, 0644);
+MODULE_PARM_DESC(tx_wd_stall_ms, "TX stall before recovery in ms (default 1000)");
+
 // ---------------rfkill---------------------------------------
 static bool openwifi_is_radio_enabled(struct openwifi_priv *priv)
 {
@@ -805,6 +814,7 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
           }
         }
       }
+      priv->txwd.done += pkt_cnt;
       if (prio_wake_up_flag)
         ieee80211_wake_queue(dev, prio);
 
@@ -1057,6 +1067,48 @@ static void openwifi_tx_lock_sanity(struct openwifi_priv *priv)
 #endif
 }
 
+/*
+ * P26c lost wake. openwifi_tx decides a stop (ring->stop_flag = prio) under
+ * priv->lock but calls ieee80211_stop_queue after the unlock (e3d17b9). A TX
+ * completion that runs in that gap clears stop_flag and wakes a queue that is
+ * not stopped yet; the stop that follows is then never undone. So stop, then
+ * re-check under the lock and wake if the completion already ran or the ring
+ * and the FPGA queue have room again.
+ */
+static bool openwifi_ring_has_room(struct openwifi_priv *priv, int ring_idx)
+{
+  struct openwifi_ring *ring = &(priv->tx_ring[ring_idx]);
+  u32 no_room, hwq;
+
+  if (!ring->bds)
+    return false;
+  no_room = tx_intf_api->TX_INTF_REG_S_AXIS_FIFO_NO_ROOM_read();
+  hwq = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read();
+  return ((no_room>>ring_idx)&1) == 0 &&
+         (NUM_TX_BD-((hwq>>(ring_idx*8))&0xFF)) > RING_ROOM_THRESHOLD &&
+         ring->bds[ring->bd_wr_idx].seq_no == 0xffff;
+}
+
+static void openwifi_stop_queue_checked(struct ieee80211_hw *dev, u8 prio, int ring_idx)
+{
+  struct openwifi_priv *priv = dev->priv;
+  struct openwifi_ring *ring = &(priv->tx_ring[ring_idx]);
+  unsigned long flags;
+  bool wake = false;
+
+  ieee80211_stop_queue(dev, prio);
+  spin_lock_irqsave(&priv->lock, flags);
+  if (ring->stop_flag != prio || openwifi_ring_has_room(priv, ring_idx)) {
+    if (ring->stop_flag == prio)
+      ring->stop_flag = -1;
+    priv->txwd.late_wake[prio]++;
+    wake = true;
+  }
+  spin_unlock_irqrestore(&priv->lock, flags);
+  if (wake)
+    ieee80211_wake_queue(dev, prio);
+}
+
 static void openwifi_tx(struct ieee80211_hw *dev,
            struct ieee80211_tx_control *control,
            struct sk_buff *skb)
@@ -1195,7 +1247,7 @@ static void openwifi_tx(struct ieee80211_hw *dev,
   if (tx_real_stop) {
     printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING real stop queue lnx prio%d map to q%d hwq len%d wr%d rd%d\n",
       sdr_compatible_str, prio, drv_ring_idx, snap_hwq, snap_wr, snap_rd);
-    ieee80211_stop_queue(dev, prio);
+    openwifi_stop_queue_checked(dev, prio, drv_ring_idx);
     goto openwifi_tx_early_out;
   }
   for (i = 0; i < n_retire; i++) {
@@ -1603,7 +1655,7 @@ openwifi_tx_wait_cookie:
     if (priv->drv_tx_reg_val[DRV_TX_REG_IDX_PRINT_CFG] & DMESG_LOG_NORMAL_QUEUE_STOP)
       printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING ieee80211_stop_queue prio%d queue%d hwq len%08x request%d wr%d rd%d\n",
               sdr_compatible_str, prio, queue_idx, snap_hwq, num_dma_symbol, snap_wr, snap_rd);
-    ieee80211_stop_queue(dev, prio);
+    openwifi_stop_queue_checked(dev, prio, drv_ring_idx);
   }
 
   if (priv->stat.stat_enable) {
@@ -1626,7 +1678,7 @@ openwifi_tx_early_out_after_lock:
   else if (tx_drop_reason == 3)
     printk_ratelimited(KERN_WARNING "%s openwifi_tx: WARNING sn %d dma_submit_error(tx_cookie) %d\n", sdr_compatible_str, snap_wr, (u32)(priv->tx_cookie));
   if (tx_real_stop)
-    ieee80211_stop_queue(dev, prio);
+    openwifi_stop_queue_checked(dev, prio, drv_ring_idx);
   report_pkt_loss_due_to_driver_drop(dev, skb);
   // dev_kfree_skb(skb);
   // printk("%s openwifi_tx: WARNING openwifi_tx_after_dma_mapping phy_tx_sn %d queue %d\n", sdr_compatible_str,priv->phy_tx_sn,queue_idx);
@@ -1782,6 +1834,194 @@ static void openwifi_irq_arm_workfn(struct work_struct *work)
          sdr_compatible_str);
 }
 
+/*
+ * P26c TX watchdog (FPGA queue freeze, P26 signature 1). The FPGA can stop
+ * starting transmissions with frames queued and the medium idle; nothing then
+ * completes, so nothing wakes the queues and the beacon work stops too. Every
+ * tx_wd_period_ms: wake any stopped queue that has room (safety net for the
+ * lost wake), and if frames are pending with no completion for tx_wd_stall_ms
+ * of idle medium, reset the TX path the way hw_init does (sub-block resets
+ * only; the AXI config registers keep their values), hand the stuck frames
+ * back to mac80211 as failed and wake all queues.
+ */
+#define XPU_STATUS_ADDR (57*4) /* slv_reg57: bit14 = ~ch_idle_final */
+#define XPU_TX_RST_BITS 0xE1   /* tx_on_detection, cw_exp/tx_control, cca/csma_ca, time_slice_gen */
+
+static void openwifi_txwd_dump(struct openwifi_priv *priv, const char *why)
+{
+  u32 t[32], x[16];
+  int i;
+
+  for (i = 0; i < 32; i++)
+    t[i] = tx_intf_api->reg_read(i*4);
+  for (i = 0; i < 16; i++)
+    x[i] = xpu_api->reg_read((i < 8 ? 16+i : 48+i)*4);
+  printk(KERN_WARNING "%s txwd %s: tx_intf r11-31 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+    sdr_compatible_str, why, t[11], t[12], t[13], t[14], t[15], t[16], t[17], t[18], t[19], t[20], t[21], t[22], t[23], t[24], t[25], t[26], t[27], t[28], t[29], t[30], t[31]);
+  printk(KERN_WARNING "%s txwd %s: xpu r16-23 %08x %08x %08x %08x %08x %08x %08x %08x r56-63 %08x %08x %08x %08x %08x %08x %08x %08x dma_sr %08x\n",
+    sdr_compatible_str, why, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15],
+    priv->tx_dma_regs ? ioread32(priv->tx_dma_regs + 4) : 0);
+}
+
+static void openwifi_txwd_slices_open(void)
+{
+  int i;
+
+  for (i = 0; i < 4; i++) {
+    xpu_api->XPU_REG_SLICE_COUNT_TOTAL_write((i<<20)|16);
+    xpu_api->XPU_REG_SLICE_COUNT_START_write((i<<20)|0);
+    xpu_api->XPU_REG_SLICE_COUNT_END_write((i<<20)|16);
+  }
+}
+
+static void openwifi_txwd_recover(struct ieee80211_hw *dev)
+{
+  struct openwifi_priv *priv = dev->priv;
+  struct openwifi_txwd *wd = &priv->txwd;
+  struct openwifi_ring *ring;
+  struct ieee80211_tx_info *info;
+  struct sk_buff *skb;
+  unsigned long flags;
+  u32 n = 0, detect_ms, test_ms = 0;
+  int i, j;
+
+  openwifi_txwd_dump(priv, "stall");
+  ieee80211_stop_queues(dev);
+
+  spin_lock_irqsave(&priv->lock, flags);
+  /* openwifi_tx may have started a DMA since the check: never cut a stream. */
+  if (priv->tx_dma_regs && !(ioread32(priv->tx_dma_regs + 4) & 0x3)) {
+    wd->skip_dma_busy++;
+    spin_unlock_irqrestore(&priv->lock, flags);
+    ieee80211_wake_queues(dev);
+    return;
+  }
+  detect_ms = wd->still_ms;
+  if (wd->test_armed) {
+    openwifi_txwd_slices_open();
+    test_ms = jiffies_to_msecs(jiffies - wd->test_start);
+    wd->last_test_ms = test_ms;
+    wd->test_armed = false;
+  }
+  for (i = 0; i < 8; i++)
+    tx_intf_api->TX_INTF_REG_MULTI_RST_write(0);
+  for (i = 0; i < 32; i++)
+    tx_intf_api->TX_INTF_REG_MULTI_RST_write(0xFFFFFFFF);
+  for (i = 0; i < 8; i++)
+    tx_intf_api->TX_INTF_REG_MULTI_RST_write(0);
+  for (i = 0; i < 8; i++)
+    openofdm_tx_api->OPENOFDM_TX_REG_MULTI_RST_write(0);
+  for (i = 0; i < 32; i++)
+    openofdm_tx_api->OPENOFDM_TX_REG_MULTI_RST_write(0xFFFFFFFF);
+  for (i = 0; i < 8; i++)
+    openofdm_tx_api->OPENOFDM_TX_REG_MULTI_RST_write(0);
+  xpu_api->XPU_REG_MULTI_RST_write(XPU_TX_RST_BITS);
+  xpu_api->XPU_REG_MULTI_RST_write(0);
+  for (i = 0; i < MAX_NUM_SW_QUEUE; i++) {
+    ring = &(priv->tx_ring[i]);
+    if (!ring->bds)
+      continue;
+    for (j = 0; j < NUM_TX_BD; j++) {
+      if (ring->bds[j].skb_linked) {
+        wd->retire_skb[n] = ring->bds[j].skb_linked;
+        wd->retire_dma[n] = ring->bds[j].dma_mapping_addr;
+        n++;
+      }
+      ring->bds[j].skb_linked = NULL;
+      ring->bds[j].dma_mapping_addr = 0;
+      ring->bds[j].seq_no = 0xffff;
+      ring->bds[j].prio = 0xff;
+      ring->bds[j].len_mpdu = 0;
+    }
+    ring->bd_rd_idx = ring->bd_wr_idx;
+    ring->stop_flag = -1;
+  }
+  wd->stall_recover++;
+  wd->retired += n;
+  wd->last_detect_ms = detect_ms;
+  wd->still_ms = 0;
+  wd->last_done = wd->done;
+  spin_unlock_irqrestore(&priv->lock, flags);
+
+  for (i = 0; i < n; i++) {
+    skb = wd->retire_skb[i];
+    if (wd->retire_dma[i])
+      dma_unmap_single(priv->tx_chan->device->dev, wd->retire_dma[i], skb->len, DMA_TO_DEVICE);
+    info = IEEE80211_SKB_CB(skb);
+    ieee80211_tx_info_clear_status(info);
+    info->status.rates[0].count = 1;
+    info->status.rates[1].idx = -1;
+    info->status.antenna = priv->runtime_tx_ant_cfg;
+    ieee80211_tx_status_irqsafe(dev, skb);
+  }
+  ieee80211_wake_queues(dev);
+  printk_ratelimited(KERN_WARNING "%s txwd: TX stall recovered #%u after %u ms (retired %u frames%s%u ms)\n",
+    sdr_compatible_str, wd->stall_recover, detect_ms, n, test_ms ? ", test block to recovery " : ", ", test_ms);
+}
+
+static void openwifi_txwd_workfn(struct work_struct *work)
+{
+  struct openwifi_txwd *wd = container_of(to_delayed_work(work), struct openwifi_txwd, work);
+  struct openwifi_priv *priv = container_of(wd, struct openwifi_priv, txwd);
+  struct ieee80211_hw *dev = priv->hw;
+  bool stopped[MAX_NUM_SW_QUEUE], stall = false;
+  u32 hwq, xpu_st, dma_sr, wake_mask = 0;
+  int period = READ_ONCE(tx_wd_period_ms);
+  unsigned long flags;
+  int i;
+
+  if (period <= 0 || !READ_ONCE(wd->run))
+    return;
+  if (!READ_ONCE(priv->irq_armed))
+    goto resched;
+
+  for (i = 0; i < MAX_NUM_SW_QUEUE; i++)
+    stopped[i] = ieee80211_queue_stopped(dev, i);
+
+  spin_lock_irqsave(&priv->lock, flags);
+  for (i = 0; i < MAX_NUM_SW_QUEUE; i++) {
+    if (stopped[i] && openwifi_ring_has_room(priv, i)) {
+      if (priv->tx_ring[i].stop_flag == i)
+        priv->tx_ring[i].stop_flag = -1;
+      wd->net_wake[i]++;
+      wake_mask |= (1<<i);
+    }
+  }
+  hwq = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read() & 0x7F7F7F7F;
+  xpu_st = xpu_api->reg_read(XPU_STATUS_ADDR);
+  dma_sr = priv->tx_dma_regs ? ioread32(priv->tx_dma_regs + 4) : 0x2;
+  if (hwq && wd->done == wd->last_done) {
+    if (xpu_st & (1<<14))
+      wd->busy_ticks++;
+    else
+      wd->still_ms += period;
+  } else {
+    wd->still_ms = 0;
+  }
+  wd->last_done = wd->done;
+  if (wd->still_ms > READ_ONCE(tx_wd_stall_ms)) {
+    if (dma_sr & 0x3) { /* MM2S halted or idle: no stream in flight */
+      wd->stall_detect++;
+      stall = true;
+    } else {
+      wd->skip_dma_busy++;
+    }
+  }
+  spin_unlock_irqrestore(&priv->lock, flags);
+
+  for (i = 0; i < MAX_NUM_SW_QUEUE; i++)
+    if (wake_mask & (1<<i))
+      ieee80211_wake_queue(dev, i);
+  if (wake_mask)
+    printk_ratelimited(KERN_WARNING "%s txwd: woke stopped queue(s) 0x%x with room\n", sdr_compatible_str, wake_mask);
+  if (stall)
+    openwifi_txwd_recover(dev);
+
+resched:
+  if (READ_ONCE(wd->run))
+    schedule_delayed_work(&wd->work, msecs_to_jiffies(period));
+}
+
 static int openwifi_start(struct ieee80211_hw *dev)
 {
   struct openwifi_priv *priv = dev->priv;
@@ -1791,6 +2031,8 @@ static int openwifi_start(struct ieee80211_hw *dev)
   /* Re-start: cancel any pending arm from a previous open */
   WRITE_ONCE(priv->irq_armed, false);
   cancel_delayed_work_sync(&priv->irq_arm_work);
+  WRITE_ONCE(priv->txwd.run, false);
+  cancel_delayed_work_sync(&priv->txwd.work);
   priv->irq_requested = false;
 
   for (i=0; i<MAX_NUM_VIF; i++) {
@@ -2041,6 +2283,15 @@ static int openwifi_start(struct ieee80211_hw *dev)
            sdr_compatible_str, delay);
   }
 
+  /* The watchdog starts after the deferred IRQ arm. */
+  priv->txwd.still_ms = 0;
+  priv->txwd.last_done = priv->txwd.done;
+  priv->txwd.test_armed = false;
+  if (tx_wd_period_ms > 0) {
+    WRITE_ONCE(priv->txwd.run, true);
+    schedule_delayed_work(&priv->txwd.work, msecs_to_jiffies(1000 + tx_wd_period_ms));
+  }
+
 // normal_out:
   printk("%s openwifi_start: normal end irq_rx=%d irq_tx=%d irq_mode=%d (arm deferred)\n",
          sdr_compatible_str, priv->irq_rx, priv->irq_tx, irq_mode);
@@ -2077,6 +2328,8 @@ static void openwifi_stop(struct ieee80211_hw *dev, bool suspend)
   /* Disarm first — cancel deferred enable and silence handlers */
   WRITE_ONCE(priv->irq_armed, false);
   cancel_delayed_work_sync(&priv->irq_arm_work);
+  WRITE_ONCE(priv->txwd.run, false);
+  cancel_delayed_work_sync(&priv->txwd.work);
 
   // enable ad9361 auto calibration and disable openwifi fpga spi control
   priv->ad9361_phy->state->auto_cal_en = true;   // turn on auto Tx quadrature calib.
@@ -2947,6 +3200,7 @@ static int openwifi_dev_probe(struct platform_device *pdev)
   priv->irq_armed = false;
   priv->irq_requested = false;
   INIT_DELAYED_WORK(&priv->irq_arm_work, openwifi_irq_arm_workfn);
+  INIT_DELAYED_WORK(&priv->txwd.work, openwifi_txwd_workfn);
 
   err = ieee80211_register_hw(dev);
   if (err) {
