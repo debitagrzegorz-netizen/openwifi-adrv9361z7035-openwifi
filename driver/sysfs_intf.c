@@ -1168,11 +1168,13 @@ static ssize_t tx_stall_stat_show(struct device *input_dev, struct device_attrib
 	struct openwifi_priv *priv = dev->priv;
 	struct openwifi_txwd *wd = &priv->txwd;
 
-	return sprintf(buf, "late_wake %u %u %u %u\nnet_wake %u %u %u %u\nstall_detect %u\nstall_recover %u\nbusy_ticks %u\nskip_dma_busy %u\nretired %u\nlast_detect_ms %u\nlast_test_ms %u\ntest_armed %u\n",
+	return sprintf(buf, "late_wake %u %u %u %u\nnet_wake %u %u %u %u\nstall_detect %u\nstall_recover %u\nbusy_ticks %u\nskip_dma_busy %u\nretired %u\nlast_detect_ms %u\nlast_test_ms %u\ntest_armed %u\norphan_detect %u\norphan_retired %u\nlast_orphan_age_ms %u\nlast_orphan_test_ms %u\ntest_dropped %u\n",
 		wd->late_wake[0], wd->late_wake[1], wd->late_wake[2], wd->late_wake[3],
 		wd->net_wake[0], wd->net_wake[1], wd->net_wake[2], wd->net_wake[3],
 		wd->stall_detect, wd->stall_recover, wd->busy_ticks, wd->skip_dma_busy,
-		wd->retired, wd->last_detect_ms, wd->last_test_ms, wd->test_armed);
+		wd->retired, wd->last_detect_ms, wd->last_test_ms, wd->test_armed,
+		wd->orphan_detect, wd->orphan_retired, wd->last_orphan_age_ms,
+		wd->last_orphan_test_ms, wd->test_dropped);
 }
 static ssize_t tx_stall_stat_store(struct device *input_dev, struct device_attribute *attr, const char *buf, size_t len)
 {
@@ -1193,12 +1195,19 @@ static ssize_t tx_stall_stat_store(struct device *input_dev, struct device_attri
 	wd->retired = 0;
 	wd->last_detect_ms = 0;
 	wd->last_test_ms = 0;
+	wd->orphan_detect = 0;
+	wd->orphan_retired = 0;
+	wd->last_orphan_age_ms = 0;
+	wd->last_orphan_test_ms = 0;
+	wd->test_dropped = 0;
 	return len;
 }
 
-/* Test only: close every time slice so no queue may transmit while the medium
- * stays idle (the P26 FPGA-freeze condition). The TX watchdog recovery opens
- * the slices again and records the block-to-recovery time in last_test_ms. */
+/* Test only. 1: close every time slice so no queue may transmit while the
+ * medium stays idle (the P26 FPGA-freeze condition); the TX watchdog recovery
+ * opens the slices again and records the block-to-recovery time in
+ * last_test_ms. 2: drop TX completions for 300 ms (orphaned BDs, P26d); the
+ * watchdog records the time to retire them in last_orphan_test_ms. */
 static ssize_t tx_stall_test_store(struct device *input_dev, struct device_attribute *attr, const char *buf, size_t len)
 {
 	struct platform_device *pdev = to_platform_device(input_dev);
@@ -1209,21 +1218,72 @@ static ssize_t tx_stall_test_store(struct device *input_dev, struct device_attri
 	int i;
 	u32 ret = kstrtol(buf, 10, &readin);
 
-	if (ret || readin != 1)
+	if (ret || (readin != 1 && readin != 2))
 		return ret ? ret : len;
 	spin_lock_irqsave(&priv->lock, flags);
 	priv->txwd.test_start = jiffies;
-	priv->txwd.test_armed = true;
-	for (i=0; i<4; i++)
-		xpu_api->XPU_REG_SLICE_COUNT_END_write((i<<20)|0);
+	if (readin == 1) {
+		priv->txwd.test_armed = true;
+		for (i=0; i<4; i++)
+			xpu_api->XPU_REG_SLICE_COUNT_END_write((i<<20)|0);
+	} else {
+		/* 2: lose TX completions for 300 ms; the frames they belong to stay
+		 * in the ring (orphaned BDs) until the watchdog retires them. */
+		priv->txwd.test_orphan_armed = true;
+		priv->txwd.test_drop_until = jiffies + msecs_to_jiffies(300);
+		if (!priv->txwd.test_drop_until)
+			priv->txwd.test_drop_until = 1;
+	}
 	spin_unlock_irqrestore(&priv->lock, flags);
 	return len;
+}
+
+/* Per TX ring: write/read index, stop_flag, occupied BDs, age of the oldest
+ * occupied BD, FPGA queue count, mac80211 queue stopped by the driver, and
+ * completions seen for that FPGA queue. */
+static ssize_t tx_ring_stat_show(struct device *input_dev, struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(input_dev);
+	struct ieee80211_hw *dev = platform_get_drvdata(pdev);
+	struct openwifi_priv *priv = dev->priv;
+	struct openwifi_ring *ring;
+	bool stopped[MAX_NUM_SW_QUEUE];
+	unsigned long flags, now;
+	u32 hwq, occ, oldest, age, ret_size = 0;
+	int i, j;
+
+	for (i=0; i<MAX_NUM_SW_QUEUE; i++)
+		stopped[i] = ieee80211_queue_stopped(dev, i);
+	spin_lock_irqsave(&priv->lock, flags);
+	now = jiffies;
+	hwq = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read();
+	for (i=0; i<MAX_NUM_SW_QUEUE; i++) {
+		ring = &(priv->tx_ring[i]);
+		occ = 0;
+		oldest = 0;
+		if (ring->bds) {
+			for (j=0; j<NUM_TX_BD; j++) {
+				if (!ring->bds[j].skb_linked)
+					continue;
+				occ++;
+				age = jiffies_to_msecs(now - ring->bds[j].tx_jiffies);
+				if (age > oldest)
+					oldest = age;
+			}
+		}
+		ret_size += sprintf(buf+ret_size, "ring%d wr %u rd %u stop_flag %d occupied %u oldest_ms %u fpga_q %u stopped %u done %u\n",
+			i, ring->bd_wr_idx, ring->bd_rd_idx, ring->stop_flag, occ, oldest,
+			(hwq >> (i*8)) & 0x7F, stopped[i], priv->txwd.ring_done[i]);
+	}
+	spin_unlock_irqrestore(&priv->lock, flags);
+	return ret_size;
 }
 
 static DEVICE_ATTR(stat_enable, S_IRUGO | S_IWUSR, stat_enable_show, stat_enable_store);
 static DEVICE_ATTR(tx_prio_queue, S_IRUGO | S_IWUSR, tx_prio_queue_show, tx_prio_queue_store);
 static DEVICE_ATTR(tx_stall_stat, S_IRUGO | S_IWUSR, tx_stall_stat_show, tx_stall_stat_store);
 static DEVICE_ATTR(tx_stall_test, S_IWUSR, NULL, tx_stall_test_store);
+static DEVICE_ATTR(tx_ring_stat, S_IRUGO, tx_ring_stat_show, NULL);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_total, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_total_show, tx_data_pkt_need_ack_num_total_store);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_total_fail, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_total_fail_show, tx_data_pkt_need_ack_num_total_fail_store);
 static DEVICE_ATTR(tx_data_pkt_need_ack_num_retx, S_IRUGO | S_IWUSR, tx_data_pkt_need_ack_num_retx_show, tx_data_pkt_need_ack_num_retx_store);
@@ -1276,6 +1336,7 @@ static struct attribute *stat_attributes[] = {
 	&dev_attr_tx_prio_queue.attr,
 	&dev_attr_tx_stall_stat.attr,
 	&dev_attr_tx_stall_test.attr,
+	&dev_attr_tx_ring_stat.attr,
 
 	&dev_attr_tx_data_pkt_need_ack_num_total.attr,
 	&dev_attr_tx_data_pkt_need_ack_num_total_fail.attr,

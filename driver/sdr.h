@@ -40,6 +40,7 @@ struct openwifi_buffer_descriptor {
   u16 seq_no;
   struct sk_buff *skb_linked;
   dma_addr_t dma_mapping_addr;
+  unsigned long tx_jiffies; /* when openwifi_tx handed the frame to the FPGA (P26d) */
   // u32 reserved;
 } __packed;
 
@@ -468,6 +469,18 @@ struct openwifi_txwd {
   u32 last_test_ms;   /* tx_stall_test: block to recovery */
   struct sk_buff *retire_skb[MAX_NUM_SW_QUEUE*NUM_TX_BD];
   dma_addr_t retire_dma[MAX_NUM_SW_QUEUE*NUM_TX_BD];
+  /* Orphaned BDs (P26d): a frame the FPGA will never complete because its
+   * completion was lost, while the queue is empty or newer frames complete. */
+  u32 ring_done[MAX_NUM_SW_QUEUE];      /* completions per FPGA queue */
+  u32 ring_last_done[MAX_NUM_SW_QUEUE];
+  u32 orphan_detect;
+  u32 orphan_retired;
+  u32 last_orphan_age_ms;
+  /* tx_stall_test 2: drop TX completions for a short window (orphan test) */
+  unsigned long test_drop_until;
+  u32 test_dropped;
+  bool test_orphan_armed;
+  u32 last_orphan_test_ms;
 };
 
 #define RX_DMA_CYCLIC_MODE

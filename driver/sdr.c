@@ -766,6 +766,15 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
     if (reg_val1 == 0xFFFFFFFF)
       break;
 
+    /* tx_stall_test 2: lose completions on purpose (orphaned-BD test). */
+    /* test_drop_until is 0 when unused; jiffies start near the 32-bit wrap,
+     * so time_before() against 0 alone would be true after boot. */
+    if (unlikely(priv->txwd.test_drop_until && time_before(jiffies, priv->txwd.test_drop_until))) {
+      priv->txwd.test_dropped++;
+      loop_count++;
+      continue;
+    }
+
     nof_retx = (reg_val1&0xF);
     last_bd_rd_idx = ((reg_val1>>5)&(NUM_TX_BD-1));
     prio = ((reg_val1>>17)&0x3);
@@ -815,6 +824,7 @@ static irqreturn_t openwifi_tx_interrupt(int irq, void *dev_id)
         }
       }
       priv->txwd.done += pkt_cnt;
+      priv->txwd.ring_done[queue_idx] += pkt_cnt;
       if (prio_wake_up_flag)
         ieee80211_wake_queue(dev, prio);
 
@@ -1642,6 +1652,7 @@ openwifi_tx_wait_cookie:
   ring->bds[ring->bd_wr_idx].prio = prio;
   ring->bds[ring->bd_wr_idx].len_mpdu = len_mpdu;
   ring->bds[ring->bd_wr_idx].seq_no = seq_no;
+  ring->bds[ring->bd_wr_idx].tx_jiffies = jiffies;
   ring->bds[ring->bd_wr_idx].skb_linked = skb;
   ring->bds[ring->bd_wr_idx].dma_mapping_addr = dma_mapping_addr;
 
@@ -1965,10 +1976,14 @@ static void openwifi_txwd_workfn(struct work_struct *work)
   struct openwifi_priv *priv = container_of(wd, struct openwifi_priv, txwd);
   struct ieee80211_hw *dev = priv->hw;
   bool stopped[MAX_NUM_SW_QUEUE], stall = false;
-  u32 hwq, xpu_st, dma_sr, wake_mask = 0;
+  u32 hwq, xpu_st, dma_sr, wake_mask = 0, orphan_mask = 0, n_orphan = 0, oldest_ms = 0, fq, k;
   int period = READ_ONCE(tx_wd_period_ms);
-  unsigned long flags;
-  int i;
+  unsigned long flags, now, stall_j;
+  struct openwifi_ring *ring;
+  struct ieee80211_tx_info *info;
+  struct sk_buff *skb;
+  bool progress;
+  int i, j;
 
   if (period <= 0 || !READ_ONCE(wd->run))
     return;
@@ -1979,17 +1994,65 @@ static void openwifi_txwd_workfn(struct work_struct *work)
     stopped[i] = ieee80211_queue_stopped(dev, i);
 
   spin_lock_irqsave(&priv->lock, flags);
+  now = jiffies;
+  stall_j = msecs_to_jiffies(READ_ONCE(tx_wd_stall_ms));
+  if (wd->test_drop_until && time_after_eq(now, wd->test_drop_until))
+    wd->test_drop_until = 0;
+  hwq = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read() & 0x7F7F7F7F;
+  dma_sr = priv->tx_dma_regs ? ioread32(priv->tx_dma_regs + 4) : 0x2;
+  /*
+   * Orphaned BDs: the FPGA serves each queue in order, so a frame older than
+   * tx_wd_stall_ms can never complete if newer frames on its queue complete,
+   * or if the FPGA queue is empty with no stream in flight. Its completion
+   * was lost. Return it to mac80211 as failed so the ring slot frees up.
+   */
   for (i = 0; i < MAX_NUM_SW_QUEUE; i++) {
-    if (stopped[i] && openwifi_ring_has_room(priv, i)) {
+    ring = &(priv->tx_ring[i]);
+    fq = (hwq >> (i*8)) & 0x7F;
+    progress = (wd->ring_done[i] != wd->ring_last_done[i]);
+    wd->ring_last_done[i] = wd->ring_done[i];
+    if (!ring->bds || !(progress || (fq == 0 && (dma_sr & 0x3))))
+      continue;
+    for (j = 0; j < NUM_TX_BD; j++) {
+      if (!ring->bds[j].skb_linked || !time_after(now, ring->bds[j].tx_jiffies + stall_j))
+        continue;
+      k = jiffies_to_msecs(now - ring->bds[j].tx_jiffies);
+      if (k > oldest_ms)
+        oldest_ms = k;
+      wd->retire_skb[n_orphan] = ring->bds[j].skb_linked;
+      wd->retire_dma[n_orphan] = ring->bds[j].dma_mapping_addr;
+      n_orphan++;
+      ring->bds[j].skb_linked = NULL;
+      ring->bds[j].dma_mapping_addr = 0;
+      ring->bds[j].seq_no = 0xffff;
+      ring->bds[j].prio = 0xff;
+      ring->bds[j].len_mpdu = 0;
+      orphan_mask |= (1<<i);
+    }
+    if (orphan_mask & (1<<i)) {
+      if (ring->stop_flag == i)
+        ring->stop_flag = -1;
+      wake_mask |= (1<<i);
+    }
+  }
+  if (n_orphan) {
+    wd->orphan_detect++;
+    wd->orphan_retired += n_orphan;
+    wd->last_orphan_age_ms = oldest_ms;
+    if (wd->test_orphan_armed) {
+      wd->last_orphan_test_ms = jiffies_to_msecs(now - wd->test_start);
+      wd->test_orphan_armed = false;
+    }
+  }
+  for (i = 0; i < MAX_NUM_SW_QUEUE; i++) {
+    if (stopped[i] && !(wake_mask & (1<<i)) && openwifi_ring_has_room(priv, i)) {
       if (priv->tx_ring[i].stop_flag == i)
         priv->tx_ring[i].stop_flag = -1;
       wd->net_wake[i]++;
       wake_mask |= (1<<i);
     }
   }
-  hwq = tx_intf_api->TX_INTF_REG_QUEUE_FIFO_DATA_COUNT_read() & 0x7F7F7F7F;
   xpu_st = xpu_api->reg_read(XPU_STATUS_ADDR);
-  dma_sr = priv->tx_dma_regs ? ioread32(priv->tx_dma_regs + 4) : 0x2;
   if (hwq && wd->done == wd->last_done) {
     if (xpu_st & (1<<14))
       wd->busy_ticks++;
@@ -2009,11 +2072,25 @@ static void openwifi_txwd_workfn(struct work_struct *work)
   }
   spin_unlock_irqrestore(&priv->lock, flags);
 
+  for (k = 0; k < n_orphan; k++) {
+    skb = wd->retire_skb[k];
+    if (wd->retire_dma[k])
+      dma_unmap_single(priv->tx_chan->device->dev, wd->retire_dma[k], skb->len, DMA_TO_DEVICE);
+    info = IEEE80211_SKB_CB(skb);
+    ieee80211_tx_info_clear_status(info);
+    info->status.rates[0].count = 1;
+    info->status.rates[1].idx = -1;
+    info->status.antenna = priv->runtime_tx_ant_cfg;
+    ieee80211_tx_status_irqsafe(dev, skb);
+  }
+  if (n_orphan)
+    printk_ratelimited(KERN_WARNING "%s txwd: retired %u orphaned BD(s) on ring(s) 0x%x, oldest %u ms\n",
+      sdr_compatible_str, n_orphan, orphan_mask, oldest_ms);
   for (i = 0; i < MAX_NUM_SW_QUEUE; i++)
     if (wake_mask & (1<<i))
       ieee80211_wake_queue(dev, i);
-  if (wake_mask)
-    printk_ratelimited(KERN_WARNING "%s txwd: woke stopped queue(s) 0x%x with room\n", sdr_compatible_str, wake_mask);
+  if (wake_mask & ~orphan_mask)
+    printk_ratelimited(KERN_WARNING "%s txwd: woke stopped queue(s) 0x%x with room\n", sdr_compatible_str, wake_mask & ~orphan_mask);
   if (stall)
     openwifi_txwd_recover(dev);
 
